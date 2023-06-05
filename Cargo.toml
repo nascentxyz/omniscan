@@ -1,0 +1,45 @@
+[package]
+name = "omniscan"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+panic = "unwind"
+
+[dependencies]
+ethers = { version = "2.0.1", features = ["ws", "rustls"]}
+eyre = "0.6.5"
+itertools = "0.10.3"
+tokio = { version = "1", features = ["full", "time"] }
+regex = "1.5.6"
+lazy_static = "1.4.0"
+rustc-hash = "1.1.0"
+serde = { version = "1", features = ["derive"]}
+hex = { version = "0.4.2"}
+serde_json = { version = "1"}
+tracing = "0.1.35"
+tracing-subscriber = {version = "0.3.11", features = ["std", "env-filter"]}
+nohash-hasher = "0.2.0"
+byte-slice-cast = "1.2.1"
+walkdir = "2.3.2"
+dotenv = "0.15.0"
+nanoid = "0.4"
+reqwest = {version = "0.11", features = ["json"]}
+b64 = "0.4"
+comfy-table = "6.0.0"
+zip = "0.6.2"
+clap = { version = "4.0.11", features = [
+    "derive",
+    "env",
+    "unicode",
+    "wrap_help",
+] }
+spinoff = "0.7.0"
+indicatif = "0.17.1"
+# code-scraper = {path = "../code-scraper"}
+rayon = "1.6.1"
+# pyrometer = {git = "https://github.com/plotchy/pyrometer", branch = "plotchy/omniparse"}
+pyrometer = {path = "../../packages/pyrometer_fork"}
+# compile-bb = {path = "../compile-bb"}
+
+
