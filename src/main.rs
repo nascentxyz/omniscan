@@ -1,12 +1,24 @@
-use std::{panic, sync::mpsc, thread};
+use std::{panic, sync::{mpsc, Arc}, time::Duration, process::{Child}, fs::OpenOptions, io::{Write}, fmt};
 use clap::{Parser, ValueHint};
+use tokio::{sync::{oneshot, Semaphore}, time::Instant};
 use walkdir::WalkDir;
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
-use std::panic::AssertUnwindSafe;
-use rayon::prelude::*;
+use ethers::etherscan::contract::{SourceCodeMetadata};
+use std::process::{Command, Stdio};
+use regex::Regex;
+use lazy_static::lazy_static;
 
-use pyrometer::Analyzer;
+lazy_static! {
+    static ref PANIC_REGEX: Regex = Regex::new(r"thread '.*?' panicked at (.+?)\n").unwrap();
+    static ref ERROR_REGEX: Regex = Regex::new(r"(?s)Error:.*?31m([a-zA-Z0-9` .]{5,})").unwrap();
+    static ref SUCCESS_REGEX: Regex = Regex::new(r"DONE ANALYZING IN: \d+ms\. Writing to cli\.\.\.\n$").unwrap();
+}
+
+const PYROMETER_TIMEOUT: Duration = Duration::from_secs(10);
+const RX_LOOP_TIMEOUT: Duration = Duration::from_secs(15);
+const INITIAL_CONTRACTS_TO_SKIP: usize = 0;
+const CONTRACTS_TO_ANALYZE: usize = 100;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -16,20 +28,35 @@ struct Args {
     #[clap(value_hint = ValueHint::FilePath, value_name = "PATH")]
     pub path: String,
 
-    /// Where to save the diagnostics file, default is stdout
+    /// Where to save the results file, default is "./data/results_MM-DD_HH-MM.csv"
     #[clap(long, short)]
     pub output: Option<String>,
 
-    /// The number of threads to use for the analysis. Default is the number of cores
-    #[clap(long, short, default_value = "1")]
-    pub jobs: u8,
+    /// The number of concurrent proccesses to use for the analysis. Default is the number of cores
+    #[clap(long, short)]
+    pub jobs: Option<u8>,
+
+
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SourceType {
-    SingleMain(String), // read string from main.sol
-    Multiple(Vec<(String, String)>), // name and string tuples from multiple .sol files
-    ContractsJson(String), // read string from contracts.json
+    /// source-string that always is read from main.sol
+    SingleMain(String), 
+    /// filename.sol and source-string tuples from multiple .sol files
+    Multiple(Vec<(String, String)>),
+    /// File contents string from contract.json
+    EtherscanMetadata(SourceCodeMetadata),
+}
+
+impl fmt::Display for SourceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceType::SingleMain(_) => write!(f, "SingleFile"),
+            SourceType::Multiple(_) => write!(f, "MultipleFiles"),
+            SourceType::EtherscanMetadata(_) => write!(f, "JSON"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -64,7 +91,8 @@ impl FiestaMetadata {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
     // convert path to PathBuf
     let abs_fiesta_path = std::path::PathBuf::from(args.path.clone());
@@ -74,6 +102,35 @@ fn main() {
         eprintln!("The path {} does not exist or is not a dir", args.path);
         std::process::exit(1);
     }
+
+    // check if output path exists, otherwise use default.
+    let output_path = match args.output {
+        Some(path) => {
+            // check if path exists, otherwise create needed parent directories
+            let path = std::path::PathBuf::from(path);
+            let path_parent = path.parent().unwrap();
+            if !path_parent.exists() {
+                std::fs::create_dir_all(&path_parent).unwrap();
+            }
+            
+            path
+        },
+        None => {
+            let mut path = std::path::PathBuf::from("./data");
+            path.push(format!("results_{}.csv", chrono::Local::now().format("%m-%d_%H-%M")));
+            let path_parent = path.parent().unwrap();
+            if !path_parent.exists() {
+                std::fs::create_dir_all(&path_parent).unwrap();
+            }
+            path
+        }
+    };
+
+    // check if jobs is set, otherwise use number of cores
+    let jobs = match args.jobs {
+        Some(jobs) => jobs,
+        None => num_cpus::get() as u8,
+    };
 
     let mut fiesta_metadatas: Vec<FiestaMetadata> = Vec::with_capacity(150_000); // 149386 contracts
     
@@ -85,7 +142,8 @@ fn main() {
     find metadata.json files -> serde_json::from_str -> ContractMetadata
     filter by CompilerVersion > v0.8.0 and doesnt contain "vyper"
     */
-    // let mut unsupported_count = 0;
+    let mut contract_count = 0;
+    let mut skipped_count = 0;
     for entry in WalkDir::new(abs_fiesta_path.join("organized_contracts")) {
         let entry = entry.unwrap();
         let path = entry.path();
@@ -98,11 +156,23 @@ fn main() {
             if !metadata.compiler_is_supported() {
                 continue;
             }
+
+            if skipped_count < INITIAL_CONTRACTS_TO_SKIP {
+                skipped_count += 1;
+                continue;
+            }
             // update the path to the directory (without the metadata.json file on the path)
             let mut path_to_dir = path.to_path_buf();
             path_to_dir.pop();
             metadata.update_path_to_dir(&path_to_dir);
             fiesta_metadatas.push(metadata);
+            if contract_count % 1000 == 0 {
+                println!("Total of {} contracts added to analysis queue", contract_count);
+            }
+            contract_count += 1;
+            if contract_count == CONTRACTS_TO_ANALYZE {
+                break;
+            }
         }
     }
 
@@ -112,162 +182,29 @@ fn main() {
 
     println!("Beginning analysis of {} contracts", fiesta_metadatas.len());
 
-
-    // let parse_results: Vec<_> = fiesta_metadatas.par_iter().map(|metadata| {
-    //     let metadata = metadata.clone();
-
-    
-    //     // wrap in catch_unwind
-    //     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-    //         analyze_with_pyrometer(metadata.clone())
-    //     }));
-    
-    //     match result {
-    //         Ok(result) => result, // if no panic occurred, return the result
-    //         Err(_) => None,       // if a panic occurred, return None
-    //     }
-    // }).collect();
-
-    // let mut parse_count = 0;
-    // let mut total_parsable = 0;
-    // for result in parse_results {
-    //     match result {
-    //         Some(true) => {
-    //             // println!("good");
-    //             parse_count += 1;
-    //             total_parsable += 1;
-    //         }
-    //         Some(false) => {
-    //             // println!("bad");
-    //             total_parsable += 1;
-    //         }
-    //         None => {
-    //             // println!("None");
-    //         }
-    //     }
-    // }
-    // println!("Parsed {} out of {} contracts", parse_count, total_parsable);
-
-
-
     // Create a channel for threads to send their results
     let (tx, rx) = mpsc::channel();
 
+    // Create a oneshot to signal the rx loop to stop
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
 
-    // now that each metadata has a source type, we can analyze using pyrometer
-    for metadata in fiesta_metadatas {
-        // Clone the transmitter for each thread
-        let tx = tx.clone();
-        let metadata = metadata.clone();
+    // Create a thread that runs the rx loop
+    let rx_handle = tokio::spawn(async move {
+        rx_loop(rx, stop_rx, output_path).await;
+    });
 
-        // Create a new thread with a large stack size (e.g., 8 MB)
-        thread::Builder::new().name(metadata.bytecode_hash.clone()).stack_size(8 * 1024 * 1024).spawn(move || {
-            // Process the file here
-            let result = analyze_with_pyrometer(metadata);
+    let tx_handle = tokio::spawn(async move {
+        tx_loop(fiesta_metadatas, tx, stop_tx, jobs.into()).await;
+    });
 
-            // Send the result back to the main thread
-            tx.send(result).expect("Failed to send result");
-        }).expect("Failed to spawn thread");
-    }
-    drop(tx);
-
-    let mut parse_count = 0;
-    let mut total_parsable = 0;
-    // Collect results from the threads as they finish
-    for result in rx {
-        match result {
-            Some(true) => {
-                println!("good");
-                parse_count += 1;
-                total_parsable += 1;
-            }
-            Some(false) => {
-                println!("bad");
-                total_parsable += 1;
-            }
-            None => {
-                println!("None");
-            }
-        }
-    }
-    println!("Parsed {} out of {} contracts", parse_count, total_parsable);
+    let _ = tokio::join!(tx_handle, rx_handle);
 }
-
-pub fn analyze_with_pyrometer(metadata: FiestaMetadata) -> Option<bool> {
-
-    match metadata.source_type.unwrap() {
-        SourceType::SingleMain(sol) => {
-            // return None;
-            // println!("Analyzing: {}", &metadata.abs_path_to_dir);
-            let mut analyzer = Analyzer {
-                root: PathBuf::from(metadata.abs_path_to_dir.clone()),
-                ..Default::default()
-            };
-
-            // catch panics, and if so return false
-            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                analyzer.parse(&sol, &PathBuf::from(metadata.abs_path_to_dir.clone()), true)
-            }));
-
-            match result {
-                Ok((_maybe_entry, _all_sources)) => {
-                    // Handle successful parsing here. If you want to return true
-                    return Some(true);
-                }
-                Err(_) => {
-                    // This will be executed if the parsing code panics.
-                    return Some(false);
-                }
-            }
-        },
-        SourceType::Multiple(multiple_files) => {
-            // println!("Found multiple .sol files: {}", &metadata.abs_path_to_dir);
-            // (name, sol_string)
-            // check whether the metadata.contract_name is in the sol_string
-            let substr_to_find = format!("contract {} ", metadata.contract_name);
-            for (name, sol_string) in multiple_files {
-                if sol_string.contains(&substr_to_find) {
-                    // println!("Analyzing: {}", &metadata.abs_path_to_dir);
-                    let mut analyzer = Analyzer {
-                        root: PathBuf::from(metadata.abs_path_to_dir.clone()),
-                        ..Default::default()
-                    };
-
-                    let path_to_sol_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(name);
-                    // println!("path_to_sol_file: {}", path_to_sol_file.display());
-                    // catch panics, and if so return false
-                    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        analyzer.parse(&sol_string, &path_to_sol_file, true)
-                    }));
-
-                    match result {
-                        Ok((_maybe_entry, _all_sources)) => {
-                            // Handle successful parsing here. If you want to return true
-                            return Some(true);
-                        }
-                        Err(_) => {
-                            // This will be executed if the parsing code panics.
-                            return Some(false);
-                        }
-                    }
-                }
-            }
-            panic!("Could not find contract name {} in multiple_files", metadata.contract_name);
-        },
-        SourceType::ContractsJson(_contracts_json) => {
-            // hopefully can use compile_bb to handle this
-        },
-    }
-
-    return None;
-}
-
 
 pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
 
     /*
     There will either be a main.sol file, several .sol files of different names, or a contracts.json file
-    - first look for contract.json
+    - first look for contracts.json
     - then look for multiple .sol files
     - then look for main.sol
     */
@@ -279,7 +216,10 @@ pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
         // println!("Looking for contracts.json: {}", &path.display());
         if path.is_file() && path.file_name().unwrap() == "contract.json" {
             path_to_contract = path.to_path_buf();
-            metadata.update_source_type(SourceType::ContractsJson(std::fs::read_to_string(path_to_contract.clone()).unwrap()));            
+            let json_string = std::fs::read_to_string(path_to_contract.clone()).unwrap();
+            // println!("{:#?}", &json_string);
+            let contract_metadata: SourceCodeMetadata = serde_json::from_str(&json_string).unwrap();
+            metadata.update_source_type(SourceType::EtherscanMetadata(contract_metadata));            
             break;
         }
     }
@@ -300,6 +240,7 @@ pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
             metadata.update_source_type(SourceType::SingleMain(std::fs::read_to_string(path_to_contract.clone()).unwrap()));
         } else if sol_files.len() == 0 {
             println!("Found no .sol files: {}. this is likely a main.vy that should be a main.sol. needs changed", &path_to_dir.display())
+            // rename main.vy to main.sol
         }
         else {
             // if there are multiple .sol files, look for main.sol
@@ -313,4 +254,332 @@ pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
             metadata.update_source_type(SourceType::Multiple(multiple_files));
         }
     }
+}
+
+
+pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> Child {
+    
+    match metadata.clone().source_type.unwrap() {
+        SourceType::SingleMain(_sol) => {
+            let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(format!("main.sol"));
+            // reformat path_to_file as a string
+            let path_to_file = path_to_file.to_str().unwrap();
+
+            let child = Command::new("pyrometer")
+                .args(&[path_to_file, "--debug"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn process");
+
+            return child
+        },
+        SourceType::Multiple(multiple_files) => {
+            let substr_to_find = format!("contract {} ", metadata.contract_name);
+            for (name, sol_string) in multiple_files {
+                if sol_string.contains(&substr_to_find) {
+                    let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(&name);
+                    let path_to_file = path_to_file.to_str().unwrap();
+
+                    let child = Command::new("pyrometer")
+                        .args(&[path_to_file, "--debug"])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("Failed to spawn process");
+
+                    return child
+                }
+            }
+            panic!("Could not find contract name {} in multiple_files", metadata.contract_name);
+        },
+        SourceType::EtherscanMetadata(_source_metadata) => {
+            let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(format!("contract.json"));
+            let path_to_file = path_to_file.to_str().unwrap();
+            let child = Command::new("pyrometer")
+                .args(&[path_to_file, "--debug"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn process");
+
+            return child
+        },
+    }
+}
+
+
+pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sender<ResultMessage>, tx_stop: oneshot::Sender<()>, max_concurrent_processes: usize) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    // Semaphore for limiting the number of concurrent processes
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_processes));
+
+    let mut join_handles = Vec::new();
+
+    for metadata in fiesta_metadatas {
+        let tx = tx_result.clone();
+        let semaphore = semaphore.clone();
+        let permit = semaphore.acquire_owned().await;
+
+        let join_handle = runtime.spawn(async move {
+            // Spawn the child process
+            let mut child = analyze_with_pyrometer(&metadata);
+            
+            let start_time = Instant::now();
+            // Poll the child process in a loop until timeout is reached
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        let result_message = ResultMessage {
+                            metadata: metadata.clone(),
+                            child: Some(child),
+                            time: start_time.elapsed().as_secs_f64(),
+                        };
+                        let _ = tx.send(result_message);
+                        break;
+                    }
+                    Ok(None) => {
+                        // Check if timeout is reached
+                        if start_time.elapsed() > PYROMETER_TIMEOUT {
+                            // println!("Timeout reached. filepath: {:?}", &metadata.abs_path_to_dir);
+                            let _ = child.kill();
+                            let result_message = ResultMessage {
+                                metadata: metadata.clone(),
+                                child: None,
+                                time: PYROMETER_TIMEOUT.as_secs_f64(),
+                            };
+                            let _ = tx.send(result_message);
+                            break;
+                        }
+                        // Sleep for a short duration to avoid busy waiting
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    Err(e) => {
+                        println!("Error while polling child process: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            
+            // Drop the semaphore permit
+            drop(permit);
+        });
+
+        join_handles.push(join_handle);
+    }
+
+    // Wait for all processes to complete
+    for handle in join_handles {
+        let _ = handle.await;
+    }
+
+    // Informing that all tasks have been dispatched
+    tx_stop.send(()).unwrap();
+    
+    // drop the runtime in a synchronous context
+    std::thread::spawn(move || {
+        runtime.shutdown_background();
+    }).join().unwrap();
+}
+
+
+pub async fn rx_loop(rx_result: mpsc::Receiver<ResultMessage>, mut rx_stop: oneshot::Receiver<()>, output_path: PathBuf) {
+
+    let results_writer = ResultsWriter {
+        output_path: output_path.clone()
+    };
+    results_writer.initiate_headers_for_results_csv();
+
+    let mut parse_count = 0;
+    let mut total_parsable = 0;
+    
+    // keep looping over the rx_result channel until the rx_stop channel is closed
+    loop {
+        match rx_stop.try_recv() {
+            Ok(_) => {
+                println!("Stopping rx_loop");
+                break;
+            }
+            Err(_) => {
+                // Use timeout to wait for the next message with a 5 seconds timeout
+                match rx_result.recv_timeout(RX_LOOP_TIMEOUT) {
+                    Ok(result_message) if result_message.child.is_some() => {
+                        // println!("Received some result message");
+                        let exit_type = check_child_exit(result_message.child.unwrap());
+                        assert!(!matches!(exit_type, ExitType::PerformanceTimeout), "PerformanceTimeout should not be possible here");
+                        results_writer.append_to_results_file(&result_message.metadata, &exit_type, result_message.time);
+                        match &exit_type {
+                            ExitType::Success => {
+                                parse_count += 1;
+                            },
+                            _ => {},
+                        }
+                        total_parsable += 1;
+                    },
+                    Ok(result_message) => {
+                        // only here when child is None
+                        // Timeout hit on process, count as failure
+                        // println!("Received none result message");
+                        results_writer.append_to_results_file(&result_message.metadata, &ExitType::PerformanceTimeout, result_message.time);
+                        total_parsable += 1;
+                    },
+                    Err(e) => {
+                        match e {
+                            mpsc::RecvTimeoutError::Timeout => {
+                                println!("Timeout hit, quitting rx_loop");
+                                return;
+                            },
+                            _ => {
+                                println!("Error receiving from rx_result: {:?}", e);
+                            }
+                        }
+                    },
+                }
+                println!("{}/{}: {:.2}%, Parsable/Total Parsable", parse_count, total_parsable, parse_count as f64 / total_parsable as f64 * 100.0);
+            }
+        }
+    }
+}
+
+pub struct ResultMessage {
+    metadata: FiestaMetadata,
+    child: Option<Child>,
+    time: f64,
+}
+
+#[derive(Clone, Debug)]
+/// Categorizes pyrometer runs into one of these variants based on the stdout string
+pub enum ExitType {
+    /// Successful parse
+    Success,
+    /// Timeout occurred while parsing
+    PerformanceTimeout,
+    /// (rel_path_to_file:line_number:col)
+    Error(String),
+    /// Type of panic (stack overflow, etc.)
+    ThreadPanic(String),
+    /// Failed to interpret the output of pyrometer. (stdout, stderr)
+    NonInterpreted(String, String),
+}
+
+impl fmt::Display for ExitType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExitType::Success => write!(f, "Success"),
+            ExitType::PerformanceTimeout => write!(f, "PerformanceTimeout"),
+            ExitType::Error(s) => write!(f, "Error: {}", s.replace(',', ":")),
+            ExitType::ThreadPanic(s) => write!(f, "ThreadPanic: {}", s.replace(',', ":")),
+            ExitType::NonInterpreted(_stdout, _stderr) => write!(f, "NonInterpreted Error"),
+        }
+    }
+}
+
+pub struct ResultsWriter {
+    pub output_path: PathBuf,
+}
+
+impl ResultsWriter {
+    pub fn convert_fields_to_header() -> String {
+        "bytecode_hash,result,time (sec),pyrometer_file_line,source_type\n".to_string()
+    }
+
+    pub fn initiate_headers_for_results_csv(&self) {
+        println!("Initiating headers for results at: {:?}", &self.output_path);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&self.output_path)
+            .unwrap();
+        
+        let header_string = Self::convert_fields_to_header();
+        file.write_all(header_string.as_bytes()).unwrap();
+    }
+
+    pub fn append_to_results_file(&self, metadata: &FiestaMetadata, exit_type: &ExitType, time: f64) {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.output_path)
+            .unwrap();
+
+        let bytecode_hash = metadata.bytecode_hash.clone();
+        let source_type = metadata.source_type.clone().unwrap();
+
+        let result_row = ResultsRow::from(exit_type.clone(), bytecode_hash, source_type, time);
+        
+        let row_string = result_row.convert_to_csv_string();
+    
+        file.write_all(row_string.as_bytes()).unwrap();
+    }
+}
+
+pub struct ResultsRow {
+    pub bytecode_hash: String,
+    pub result: ExitType,
+    pub time: f64,
+    pub source_type: SourceType,
+}
+
+impl ResultsRow {
+    
+    pub fn from(result: ExitType, bytecode_hash: String, source_type: SourceType, time: f64) -> Self {
+
+        Self {
+            bytecode_hash,
+            result: result.clone(),
+            time,
+            source_type,
+        }
+    }
+
+    pub fn convert_to_csv_string(&self) -> String {
+        format!("{},{},{:.3},{}\n", self.bytecode_hash, self.result, self.time, self.source_type)
+    }
+}
+
+pub fn check_child_exit(child: Child) -> ExitType {
+    // determine if the exit status has panics, errors, etc.
+    if child.stdout.is_some() & child.stderr.is_some() {
+        let stdout = child.stdout.unwrap();
+        let mut stdout_reader = std::io::BufReader::new(stdout);
+        let mut stdout_string = String::new();
+        std::io::Read::read_to_string(&mut stdout_reader, &mut stdout_string).unwrap();
+        let mut stderr = child.stderr.unwrap();
+        let mut stderr_string = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut stderr_string).unwrap();
+
+        
+        // convert stdout into one of the ExitType variants
+        convert_pyrometer_output_to_exit_type(stdout_string, stderr_string)
+
+    } else {
+        dbg!(&child);
+        panic!("Child stdout is None")
+    }
+}
+
+pub fn convert_pyrometer_output_to_exit_type(stdout_string: String, stderr_string: String) -> ExitType {
+    // Check if the output is from stderr and contains the phrase "thread 'main' panicked at"
+    if let Some(captures) = PANIC_REGEX.captures(&stderr_string) {
+        return ExitType::ThreadPanic(captures[1].to_string());
+    }
+    
+    // Check if the output is from stdout and contains an error message
+    if let Some(captures) = ERROR_REGEX.captures(&stdout_string) {
+        let error_message = format!("{}", captures[1].trim());
+        return ExitType::Error(error_message);
+    }
+    
+    // Check if the output is from stdout and contains a success message
+    if SUCCESS_REGEX.is_match(&stdout_string) {
+        return ExitType::Success;
+    }
+    
+    // If none of the above patterns are matched, return a NonInterpreted variant.
+    ExitType::NonInterpreted(stdout_string, stderr_string)
 }

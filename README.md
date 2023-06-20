@@ -10,21 +10,24 @@ You will need a local copy of the smart-contract-fiesta dataset:
 - First, make sure to install [git-lfs](https://git-lfs.github.com/) if you haven't already
 ```bash
 git clone https://huggingface.co/datasets/Zellic/smart-contract-fiesta
-cd smart-contract-fiesta
-git lfs install
-git lfs fetch
-git lfs checkout
 ```
 
 TODO:
-first grab all unique bytecode hashes within smart-contract-fiesta
-set a pool of workers 
-pop a bytecode hash into the pool
-workers take a bytecode hash and find the source code
-- preprocess filtering with sol >0.8
-workers build a pyro obj with the source code and remappings
+
+1. convert the stdout of the pyrometer process to an exit type
+
+foresee these exit types:
+    success
+    thread panic
+    pyrometer error
+    timeout
+*this conversion is not trivial, the stdout is messy
+
+honestly this is likely to change, dont spend so much time making it perfect
+intuition says thread panic can be regexed, pyrometer error will have info from the first red `Error:` line, need to see if there is identifying info from there
+timeout i just need to add in the secs used for timeout. say "Timeout: 10s"
+
+2. fill in the `ResultsRow::convert_to_csv_string()` function
 
 
-
-use pyrometer as lib
-pyrometer remappings need to be inlined rather than cli
+3. view the proportions of exit types as a pie chart, share dataset with dan/brock
