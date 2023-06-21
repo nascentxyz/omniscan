@@ -15,18 +15,25 @@ lazy_static! {
     static ref SUCCESS_REGEX: Regex = Regex::new(r"DONE ANALYZING IN: \d+ms\. Writing to cli\.\.\.\n$").unwrap();
 }
 
-const PYROMETER_TIMEOUT: Duration = Duration::from_secs(10);
-const RX_LOOP_TIMEOUT: Duration = Duration::from_secs(15);
-const INITIAL_CONTRACTS_TO_SKIP: usize = 0;
-const CONTRACTS_TO_ANALYZE: usize = 100;
+const FIESTA_TOTAL_CONTRACTS: usize = 150_000;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
 
-    /// Either a path to the smart-contract-fiesta root directory
+    /// Path to the smart-contract-fiesta root directory
     #[clap(value_hint = ValueHint::FilePath, value_name = "PATH")]
     pub path: String,
+
+    /// The number of contracts to run pyrometer on. Default is 5000
+    /// If set to 0, all contracts will be analyzed
+    #[clap(long, short)]
+    pub num_contracts: Option<usize>,
+
+    /// Timeout for each pyrometer process (secs). Default is 2 seconds, decimals supported.
+    /// If set to 0, there will be no timeout. Not advised
+    #[clap(long, short)]
+    pub timeout: Option<f64>,
 
     /// Where to save the results file, default is "./data/results_MM-DD_HH-MM.csv"
     #[clap(long, short)]
@@ -36,6 +43,10 @@ struct Args {
     #[clap(long, short)]
     pub jobs: Option<u8>,
 
+    /// The number of contracts to initially skip over. Default is 0.
+    /// This is intended for debugging purposes
+    #[clap(long, short)]
+    pub skip_contracts: Option<usize>,
 
 }
 
@@ -132,12 +143,43 @@ async fn main() {
         None => num_cpus::get() as u8,
     };
 
-    let mut fiesta_metadatas: Vec<FiestaMetadata> = Vec::with_capacity(150_000); // 149386 contracts
+    // check if timeout is set, otherwise use default
+    let (pyrometer_timeout, rx_loop_timeout) = match args.timeout {
+        Some(timeout) => {
+            if timeout == 0.0 {
+                (1_000_000.0, 1_000_000.0) // inf
+            } else {
+                (timeout, timeout + 1.0)
+            }
+        },
+        None => (2.0, 2.0 + 1.0),
+    };
+
+    // check if num_contracts is set, otherwise use default
+    let num_contracts = match args.num_contracts {
+        Some(num_contracts) => {
+            if num_contracts == 0 {
+                std::usize::MAX
+            } else {
+                num_contracts
+            }
+        },
+        None => 5000,
+    };
+
+    // check if skip_contracts is set, otherwise use default
+    let skip_contracts = match args.skip_contracts {
+        Some(skip_contracts) => skip_contracts,
+        None => 0,
+    };
+
+
+    let mut fiesta_metadatas: Vec<FiestaMetadata> = Vec::with_capacity(FIESTA_TOTAL_CONTRACTS);
     
     /*
     walk the directory and collect all bytecode hashes
     path -> organized_contracts -> XX -> bytecodehash -> metadata.json
-    {"ContractName":"Vyper_contract","CompilerVersion":"vyper:0.3.1","Runs":0,"OptimizationUsed":false,"BytecodeHash":"832117d7cd8eb3c6a7677a71fd59bd258faf57c4434f57151d51950060922abd"}
+    metadata ex: {"ContractName":"Vyper_contract","CompilerVersion":"vyper:0.3.1","Runs":0,"OptimizationUsed":false,"BytecodeHash":"832117d7cd8eb3c6a7677a71fd59bd258faf57c4434f57151d51950060922abd"}
 
     find metadata.json files -> serde_json::from_str -> ContractMetadata
     filter by CompilerVersion > v0.8.0 and doesnt contain "vyper"
@@ -157,7 +199,7 @@ async fn main() {
                 continue;
             }
 
-            if skipped_count < INITIAL_CONTRACTS_TO_SKIP {
+            if skipped_count < skip_contracts {
                 skipped_count += 1;
                 continue;
             }
@@ -166,11 +208,11 @@ async fn main() {
             path_to_dir.pop();
             metadata.update_path_to_dir(&path_to_dir);
             fiesta_metadatas.push(metadata);
+            contract_count += 1;
             if contract_count % 1000 == 0 {
                 println!("Total of {} contracts added to analysis queue", contract_count);
             }
-            contract_count += 1;
-            if contract_count == CONTRACTS_TO_ANALYZE {
+            if contract_count == num_contracts {
                 break;
             }
         }
@@ -190,71 +232,17 @@ async fn main() {
 
     // Create a thread that runs the rx loop
     let rx_handle = tokio::spawn(async move {
-        rx_loop(rx, stop_rx, output_path).await;
+        rx_loop(rx, stop_rx, output_path, rx_loop_timeout).await;
     });
 
     let tx_handle = tokio::spawn(async move {
-        tx_loop(fiesta_metadatas, tx, stop_tx, jobs.into()).await;
+        tx_loop(fiesta_metadatas, tx, stop_tx, jobs.into(), pyrometer_timeout).await;
     });
 
     let _ = tokio::join!(tx_handle, rx_handle);
 }
 
-pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
 
-    /*
-    There will either be a main.sol file, several .sol files of different names, or a contracts.json file
-    - first look for contracts.json
-    - then look for multiple .sol files
-    - then look for main.sol
-    */
-    let path_to_dir = std::path::PathBuf::from(&metadata.abs_path_to_dir);
-    let mut path_to_contract = std::path::PathBuf::new();
-    for entry in WalkDir::new(&path_to_dir) {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        // println!("Looking for contracts.json: {}", &path.display());
-        if path.is_file() && path.file_name().unwrap() == "contract.json" {
-            path_to_contract = path.to_path_buf();
-            let json_string = std::fs::read_to_string(path_to_contract.clone()).unwrap();
-            // println!("{:#?}", &json_string);
-            let contract_metadata: SourceCodeMetadata = serde_json::from_str(&json_string).unwrap();
-            metadata.update_source_type(SourceType::EtherscanMetadata(contract_metadata));            
-            break;
-        }
-    }
-    // if contracts.json wasnt found, look for multiple .sol files
-    if path_to_contract == std::path::PathBuf::new() {
-        let mut sol_files = Vec::new();
-        for entry in WalkDir::new(&path_to_dir) {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.is_file() && path.extension().unwrap() == "sol" {
-                sol_files.push(path.to_path_buf());
-            }
-        }
-        // if there is only one .sol file, use that
-
-        if sol_files.len() == 1 {
-            path_to_contract = sol_files[0].to_path_buf();
-            metadata.update_source_type(SourceType::SingleMain(std::fs::read_to_string(path_to_contract.clone()).unwrap()));
-        } else if sol_files.len() == 0 {
-            println!("Found no .sol files: {}. this is likely a main.vy that should be a main.sol. needs changed", &path_to_dir.display())
-            // rename main.vy to main.sol
-        }
-        else {
-            // if there are multiple .sol files, look for main.sol
-            // println!("Found multiple .sol files: {}", &path_to_dir.display());
-            let mut multiple_files = sol_files.into_iter().map(|path| {
-                let name = path.file_name().unwrap().to_str().unwrap().to_string();
-                let string = std::fs::read_to_string(path).unwrap();
-                (name, string)
-            }).collect::<Vec<(String, String)>>();
-            multiple_files.sort_by(|a, b| a.0.cmp(&b.0));
-            metadata.update_source_type(SourceType::Multiple(multiple_files));
-        }
-    }
-}
 
 
 pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> Child {
@@ -309,7 +297,7 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> Child {
 }
 
 
-pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sender<ResultMessage>, tx_stop: oneshot::Sender<()>, max_concurrent_processes: usize) {
+pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sender<ResultMessage>, tx_stop: oneshot::Sender<()>, max_concurrent_processes: usize, pyrometer_timeout: f64) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_time()
         .build()
@@ -318,6 +306,7 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
     // Semaphore for limiting the number of concurrent processes
     let semaphore = Arc::new(Semaphore::new(max_concurrent_processes));
 
+    let pyrometer_timeout_duration = Duration::from_secs_f64(pyrometer_timeout);
     let mut join_handles = Vec::new();
 
     for metadata in fiesta_metadatas {
@@ -344,18 +333,17 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
                     }
                     Ok(None) => {
                         // Check if timeout is reached
-                        if start_time.elapsed() > PYROMETER_TIMEOUT {
-                            // println!("Timeout reached. filepath: {:?}", &metadata.abs_path_to_dir);
+                        if start_time.elapsed() > pyrometer_timeout_duration {
                             let _ = child.kill();
                             let result_message = ResultMessage {
                                 metadata: metadata.clone(),
                                 child: None,
-                                time: PYROMETER_TIMEOUT.as_secs_f64(),
+                                time: pyrometer_timeout,
                             };
                             let _ = tx.send(result_message);
                             break;
                         }
-                        // Sleep for a short duration to avoid busy waiting
+                        // async sleep for a short duration to avoid busy waiting. this wait is also our resolution for pyro completion
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                     Err(e) => {
@@ -387,13 +375,14 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
 }
 
 
-pub async fn rx_loop(rx_result: mpsc::Receiver<ResultMessage>, mut rx_stop: oneshot::Receiver<()>, output_path: PathBuf) {
+pub async fn rx_loop(rx_result: mpsc::Receiver<ResultMessage>, mut rx_stop: oneshot::Receiver<()>, output_path: PathBuf, rx_loop_timeout: f64) {
 
     let results_writer = ResultsWriter {
         output_path: output_path.clone()
     };
     results_writer.initiate_headers_for_results_csv();
 
+    let rx_loop_timeout = Duration::from_secs_f64(rx_loop_timeout);
     let mut parse_count = 0;
     let mut total_parsable = 0;
     
@@ -406,7 +395,7 @@ pub async fn rx_loop(rx_result: mpsc::Receiver<ResultMessage>, mut rx_stop: ones
             }
             Err(_) => {
                 // Use timeout to wait for the next message with a 5 seconds timeout
-                match rx_result.recv_timeout(RX_LOOP_TIMEOUT) {
+                match rx_result.recv_timeout(rx_loop_timeout) {
                     Ok(result_message) if result_message.child.is_some() => {
                         // println!("Received some result message");
                         let exit_type = check_child_exit(result_message.child.unwrap());
@@ -582,4 +571,60 @@ pub fn convert_pyrometer_output_to_exit_type(stdout_string: String, stderr_strin
     
     // If none of the above patterns are matched, return a NonInterpreted variant.
     ExitType::NonInterpreted(stdout_string, stderr_string)
+}
+
+pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
+
+    /*
+    There will either be a main.sol file, several .sol files of different names, or a contracts.json file
+    - first look for contracts.json
+    - then look for one .sol file named main.sol
+    - then look for multiple .sol files
+    - edgecase is a single main.vy file that has misconfigured metadata.json... there's about 10 of these, we can skip.
+    */
+    let path_to_dir = std::path::PathBuf::from(&metadata.abs_path_to_dir);
+    let mut path_to_contract = std::path::PathBuf::new();
+    for entry in WalkDir::new(&path_to_dir) {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        // println!("Looking for contracts.json: {}", &path.display());
+        if path.is_file() && path.file_name().unwrap() == "contract.json" {
+            path_to_contract = path.to_path_buf();
+            let json_string = std::fs::read_to_string(path_to_contract.clone()).unwrap();
+            // println!("{:#?}", &json_string);
+            let contract_metadata: SourceCodeMetadata = serde_json::from_str(&json_string).unwrap();
+            metadata.update_source_type(SourceType::EtherscanMetadata(contract_metadata));            
+            break;
+        }
+    }
+    // if contracts.json wasnt found, look for multiple .sol files
+    if path_to_contract == std::path::PathBuf::new() {
+        let mut sol_files = Vec::new();
+        for entry in WalkDir::new(&path_to_dir) {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_file() && path.extension().unwrap() == "sol" {
+                sol_files.push(path.to_path_buf());
+            }
+        }
+        // if there is only one .sol file, use that
+
+        if sol_files.len() == 1 {
+            path_to_contract = sol_files[0].to_path_buf();
+            metadata.update_source_type(SourceType::SingleMain(std::fs::read_to_string(path_to_contract.clone()).unwrap()));
+        } else if sol_files.len() == 0 {
+            println!("Found no .sol files: {}. this is likely a main.vy that should be a main.sol. needs changed", &path_to_dir.display())
+            // could go to path_to_contract and rename main.vy to main.sol
+        }
+        else {
+            // if there are multiple .sol files, look for main.sol
+            let mut multiple_files = sol_files.into_iter().map(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                let string = std::fs::read_to_string(path).unwrap();
+                (name, string)
+            }).collect::<Vec<(String, String)>>();
+            multiple_files.sort_by(|a, b| a.0.cmp(&b.0));
+            metadata.update_source_type(SourceType::Multiple(multiple_files));
+        }
+    }
 }
