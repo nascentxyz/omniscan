@@ -473,7 +473,7 @@ pub struct ResultsWriter {
 
 impl ResultsWriter {
     pub fn convert_fields_to_header() -> String {
-        "bytecode_hash,result,time (sec),pyrometer_file_line,source_type\n".to_string()
+        "bytecode_hash,result,time (sec),source_type\n".to_string()
     }
 
     pub fn initiate_headers_for_results_csv(&self) {
