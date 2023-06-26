@@ -55,3 +55,22 @@ These are timings I've found using my own machines.
 | 5000        | Ryzen 5950x | 16      | 10s     |  8min     |
 | 137000 (full set) | Ryzen 5950x | 16       | 10s     |  3h48min     |
 | 5000 | M2 Macbook Pro | 12 | 2s |  5min14s  |
+
+### Results
+
+The results are saved as a csv file with the following columns:
+- `bytecode_hash`: Bytecode hash of the contract, identifiable key for smart-contract-fiesta
+- `result`: The result of the analysis, one of {`success`, `timeout`, `error`, `thread-panic`, `non-interpreted`}
+- `time`: The time taken to analyze the contract (secs)
+- `source_type`: The source type of the contract, one of {`single-file`, `multi-file`, `solc-standard-json`}
+
+#### Pyrometer Snapshot 6/20/23
+| Type	| Count	| Percent |
+| ----- | ----- | ------- |
+|Success | 49796 | 36.32 |
+|Timeout | 39453 | 28.78 |
+|Error	| 43089	| 31.43 |
+|Panic	| 4625	| 3.37 |
+|NonInterpreted	| 125 | 0.09 |
+
+![Full result pyrometer snapshot 6_20_23](./media/chart.svg)
