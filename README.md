@@ -2,7 +2,7 @@
 
 Use [pyrometer](https://github.com/nascentxyz/pyrometer) to scan all of Ethereum mainnet.
 
-Uses the Zellic smart-contract-fiesta dataset snapshot as the source of smart contract code.
+Uses the Zellic [smart-contract-fiesta](https://huggingface.co/datasets/Zellic/smart-contract-fiesta) dataset snapshot as the source of smart contract code.
 
 ATM, this is used for testing parsability of contracts to provide diagnostics for improving pyrometer. In the future this will be extended to run available detectors and analysis on the contracts to find bugs and vulnerabilities {⚪️,🧢}
 ## Installation
