@@ -1,18 +1,39 @@
-use std::{panic, sync::{mpsc, Arc}, time::Duration, process::{Child}, fs::OpenOptions, io::{Write}, fmt};
 use clap::{Parser, ValueHint};
-use tokio::{sync::{oneshot, Semaphore}, time::Instant};
-use walkdir::WalkDir;
-use serde::{Serialize, Deserialize};
-use std::path::PathBuf;
-use ethers::etherscan::contract::{SourceCodeMetadata};
-use std::process::{Command, Stdio};
-use regex::Regex;
+use ethers::etherscan::contract::SourceCodeMetadata;
+use ethers::types::U256;
 use lazy_static::lazy_static;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::path::PathBuf;
+use std::{
+    fmt,
+    fs::OpenOptions,
+    io::Write,
+    panic,
+    process::Child,
+    sync::{mpsc, Arc},
+    time::Duration,
+};
+use std::{
+    fs,
+    process::{Command, Stdio},
+};
+use tokio::{
+    sync::{oneshot, Semaphore},
+    time::Instant,
+};
+use walkdir::WalkDir;
 
 lazy_static! {
     static ref PANIC_REGEX: Regex = Regex::new(r"thread '.*?' panicked at (.+?)\n").unwrap();
+    static ref DEBUG_PANIC_REGEX: Regex =
+        Regex::new(r#"thread '.*?' panicked at .+?\nEncountered an error: (\w+)"#).unwrap();
     static ref ERROR_REGEX: Regex = Regex::new(r"(?s)Error:.*?31m([a-zA-Z0-9` .]{5,})").unwrap();
-    static ref SUCCESS_REGEX: Regex = Regex::new(r"DONE ANALYZING IN: \d+ms\. Writing to cli\.\.\.\n$").unwrap();
+    static ref SUCCESS_REGEX: Regex =
+        Regex::new(r"DONE ANALYZING IN: \d+ms\. Writing to cli\.\.\.\n$").unwrap();
+    static ref STACK_OVERFLOW_REGEX: Regex =
+        Regex::new(r"thread '.*?' has overflowed its stack\n").unwrap();
 }
 
 const FIESTA_TOTAL_CONTRACTS: usize = 150_000;
@@ -20,7 +41,6 @@ const FIESTA_TOTAL_CONTRACTS: usize = 150_000;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-
     /// Path to the smart-contract-fiesta root directory
     #[clap(value_hint = ValueHint::FilePath, value_name = "PATH")]
     pub path: String,
@@ -47,13 +67,12 @@ struct Args {
     /// This is intended for debugging purposes
     #[clap(long, short)]
     pub skip_contracts: Option<usize>,
-
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum SourceType {
     /// source-string that always is read from main.sol
-    SingleMain(String), 
+    SingleMain(String),
     /// filename.sol and source-string tuples from multiple .sol files
     Multiple(Vec<(String, String)>),
     /// File contents string from contract.json
@@ -93,7 +112,7 @@ impl FiestaMetadata {
         self.compiler_version.starts_with("v0.8.") && !self.compiler_version.contains("vyper")
     }
 
-    pub fn update_path_to_dir(&mut self, path_to_dir: &PathBuf) {
+    pub fn update_path_to_dir(&mut self, path_to_dir: &Path) {
         self.abs_path_to_dir = path_to_dir.to_str().unwrap().to_string();
     }
 
@@ -109,7 +128,7 @@ async fn main() {
     let abs_fiesta_path = std::path::PathBuf::from(args.path.clone());
 
     // check if path exists and is a directory
-    if !abs_fiesta_path.exists() && !abs_fiesta_path.is_dir(){
+    if !abs_fiesta_path.exists() && !abs_fiesta_path.is_dir() {
         eprintln!("The path {} does not exist or is not a dir", args.path);
         std::process::exit(1);
     }
@@ -121,17 +140,20 @@ async fn main() {
             let path = std::path::PathBuf::from(path);
             let path_parent = path.parent().unwrap();
             if !path_parent.exists() {
-                std::fs::create_dir_all(&path_parent).unwrap();
+                std::fs::create_dir_all(path_parent).unwrap();
             }
-            
+
             path
-        },
+        }
         None => {
             let mut path = std::path::PathBuf::from("./data");
-            path.push(format!("results_{}.csv", chrono::Local::now().format("%m-%d_%H-%M")));
+            path.push(format!(
+                "results_{}.csv",
+                chrono::Local::now().format("%m-%d_%H-%M")
+            ));
             let path_parent = path.parent().unwrap();
             if !path_parent.exists() {
-                std::fs::create_dir_all(&path_parent).unwrap();
+                std::fs::create_dir_all(path_parent).unwrap();
             }
             path
         }
@@ -151,7 +173,7 @@ async fn main() {
             } else {
                 (timeout, timeout + 1.0)
             }
-        },
+        }
         None => (2.0, 2.0 + 1.0),
     };
 
@@ -163,19 +185,15 @@ async fn main() {
             } else {
                 num_contracts
             }
-        },
+        }
         None => 5000,
     };
 
     // check if skip_contracts is set, otherwise use default
-    let skip_contracts = match args.skip_contracts {
-        Some(skip_contracts) => skip_contracts,
-        None => 0,
-    };
-
+    let skip_contracts = args.skip_contracts.unwrap_or(0);
 
     let mut fiesta_metadatas: Vec<FiestaMetadata> = Vec::with_capacity(FIESTA_TOTAL_CONTRACTS);
-    
+
     /*
     walk the directory and collect all bytecode hashes
     path -> organized_contracts -> XX -> bytecodehash -> metadata.json
@@ -210,7 +228,10 @@ async fn main() {
             fiesta_metadatas.push(metadata);
             contract_count += 1;
             if contract_count % 1000 == 0 {
-                println!("Total of {} contracts added to analysis queue", contract_count);
+                println!(
+                    "Total of {} contracts added to analysis queue",
+                    contract_count
+                );
             }
             if contract_count == num_contracts {
                 break;
@@ -218,8 +239,9 @@ async fn main() {
         }
     }
 
-
-    fiesta_metadatas.iter_mut().for_each(|metadata| { collect_contract_sources(metadata); });
+    fiesta_metadatas.iter_mut().for_each(|metadata| {
+        collect_contract_sources(metadata);
+    });
     fiesta_metadatas.retain(|metadata| metadata.source_type.is_some());
 
     println!("Beginning analysis of {} contracts", fiesta_metadatas.len());
@@ -236,38 +258,43 @@ async fn main() {
     });
 
     let tx_handle = tokio::spawn(async move {
-        tx_loop(fiesta_metadatas, tx, stop_tx, jobs.into(), pyrometer_timeout).await;
+        tx_loop(
+            fiesta_metadatas,
+            tx,
+            stop_tx,
+            jobs.into(),
+            pyrometer_timeout,
+        )
+        .await;
     });
 
     let _ = tokio::join!(tx_handle, rx_handle);
 }
 
-
-
-
-pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> Child {
-    
+pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> (Child, u64) {
     match metadata.clone().source_type.unwrap() {
         SourceType::SingleMain(_sol) => {
-            let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(format!("main.sol"));
+            let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join("main.sol");
             // reformat path_to_file as a string
             let path_to_file = path_to_file.to_str().unwrap();
+            let size = fs::metadata(path_to_file).unwrap().len();
 
             let child = Command::new("pyrometer")
-                .args(&[path_to_file, "--debug"])
+                .args(&[path_to_file, "--debug", "--debug-panic"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("Failed to spawn process");
 
-            return child
-        },
+            (child, size)
+        }
         SourceType::Multiple(multiple_files) => {
             let substr_to_find = format!("contract {} ", metadata.contract_name);
             for (name, sol_string) in multiple_files {
                 if sol_string.contains(&substr_to_find) {
-                    let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(&name);
+                    let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(name);
                     let path_to_file = path_to_file.to_str().unwrap();
+                    let size = fs::metadata(path_to_file).unwrap().len();
 
                     let child = Command::new("pyrometer")
                         .args(&[path_to_file, "--debug"])
@@ -276,14 +303,19 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> Child {
                         .spawn()
                         .expect("Failed to spawn process");
 
-                    return child
+                    return (child, size);
                 }
             }
-            panic!("Could not find contract name {} in multiple_files", metadata.contract_name);
-        },
+            panic!(
+                "Could not find contract name {} in multiple_files",
+                metadata.contract_name
+            );
+        }
         SourceType::EtherscanMetadata(_source_metadata) => {
-            let path_to_file = PathBuf::from(metadata.abs_path_to_dir.clone()).join(format!("contract.json"));
+            let path_to_file =
+                PathBuf::from(metadata.abs_path_to_dir.clone()).join("contract.json");
             let path_to_file = path_to_file.to_str().unwrap();
+            let size = fs::metadata(path_to_file).unwrap().len();
             let child = Command::new("pyrometer")
                 .args(&[path_to_file, "--debug"])
                 .stdout(Stdio::piped())
@@ -291,13 +323,18 @@ pub fn analyze_with_pyrometer(metadata: &FiestaMetadata) -> Child {
                 .spawn()
                 .expect("Failed to spawn process");
 
-            return child
-        },
+            (child, size)
+        }
     }
 }
 
-
-pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sender<ResultMessage>, tx_stop: oneshot::Sender<()>, max_concurrent_processes: usize, pyrometer_timeout: f64) {
+pub async fn tx_loop(
+    fiesta_metadatas: Vec<FiestaMetadata>,
+    tx_result: mpsc::Sender<ResultMessage>,
+    tx_stop: oneshot::Sender<()>,
+    max_concurrent_processes: usize,
+    pyrometer_timeout: f64,
+) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_time()
         .build()
@@ -316,8 +353,8 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
 
         let join_handle = runtime.spawn(async move {
             // Spawn the child process
-            let mut child = analyze_with_pyrometer(&metadata);
-            
+            let (mut child, size) = analyze_with_pyrometer(&metadata);
+
             let start_time = Instant::now();
             // Poll the child process in a loop until timeout is reached
             loop {
@@ -327,6 +364,7 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
                             metadata: metadata.clone(),
                             child: Some(child),
                             time: start_time.elapsed().as_secs_f64(),
+                            size,
                         };
                         let _ = tx.send(result_message);
                         break;
@@ -339,6 +377,7 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
                                 metadata: metadata.clone(),
                                 child: None,
                                 time: pyrometer_timeout,
+                                size,
                             };
                             let _ = tx.send(result_message);
                             break;
@@ -352,7 +391,7 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
                     }
                 }
             }
-            
+
             // Drop the semaphore permit
             drop(permit);
         });
@@ -367,25 +406,30 @@ pub async fn tx_loop(fiesta_metadatas: Vec<FiestaMetadata>, tx_result: mpsc::Sen
 
     // Informing that all tasks have been dispatched
     tx_stop.send(()).unwrap();
-    
+
     // drop the runtime in a synchronous context
     std::thread::spawn(move || {
         runtime.shutdown_background();
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
-
-pub async fn rx_loop(rx_result: mpsc::Receiver<ResultMessage>, mut rx_stop: oneshot::Receiver<()>, output_path: PathBuf, rx_loop_timeout: f64) {
-
+pub async fn rx_loop(
+    rx_result: mpsc::Receiver<ResultMessage>,
+    mut rx_stop: oneshot::Receiver<()>,
+    output_path: PathBuf,
+    rx_loop_timeout: f64,
+) {
     let results_writer = ResultsWriter {
-        output_path: output_path.clone()
+        output_path: output_path.clone(),
     };
     results_writer.initiate_headers_for_results_csv();
 
     let rx_loop_timeout = Duration::from_secs_f64(rx_loop_timeout);
     let mut parse_count = 0;
     let mut total_parsable = 0;
-    
+
     // keep looping over the rx_result channel until the rx_stop channel is closed
     loop {
         match rx_stop.try_recv() {
@@ -399,36 +443,49 @@ pub async fn rx_loop(rx_result: mpsc::Receiver<ResultMessage>, mut rx_stop: ones
                     Ok(result_message) if result_message.child.is_some() => {
                         // println!("Received some result message");
                         let exit_type = check_child_exit(result_message.child.unwrap());
-                        assert!(!matches!(exit_type, ExitType::PerformanceTimeout), "PerformanceTimeout should not be possible here");
-                        results_writer.append_to_results_file(&result_message.metadata, &exit_type, result_message.time);
-                        match &exit_type {
-                            ExitType::Success => {
-                                parse_count += 1;
-                            },
-                            _ => {},
+                        assert!(
+                            !matches!(exit_type, ExitType::PerformanceTimeout),
+                            "PerformanceTimeout should not be possible here"
+                        );
+                        results_writer.append_to_results_file(
+                            &result_message.metadata,
+                            &exit_type,
+                            result_message.time,
+                            result_message.size,
+                        );
+                        if let ExitType::Success = &exit_type {
+                            parse_count += 1;
                         }
                         total_parsable += 1;
-                    },
+                    }
                     Ok(result_message) => {
                         // only here when child is None
                         // Timeout hit on process, count as failure
                         // println!("Received none result message");
-                        results_writer.append_to_results_file(&result_message.metadata, &ExitType::PerformanceTimeout, result_message.time);
+                        results_writer.append_to_results_file(
+                            &result_message.metadata,
+                            &ExitType::PerformanceTimeout,
+                            result_message.time,
+                            result_message.size,
+                        );
                         total_parsable += 1;
-                    },
-                    Err(e) => {
-                        match e {
-                            mpsc::RecvTimeoutError::Timeout => {
-                                println!("Timeout hit, quitting rx_loop");
-                                return;
-                            },
-                            _ => {
-                                println!("Error receiving from rx_result: {:?}", e);
-                            }
+                    }
+                    Err(e) => match e {
+                        mpsc::RecvTimeoutError::Timeout => {
+                            println!("Timeout hit, quitting rx_loop");
+                            return;
+                        }
+                        _ => {
+                            println!("Error receiving from rx_result: {:?}", e);
                         }
                     },
                 }
-                println!("{}/{}: {:.2}%, Parsable/Total Parsable", parse_count, total_parsable, parse_count as f64 / total_parsable as f64 * 100.0);
+                println!(
+                    "{}/{}: {:.2}%, Parsable/Total Parsable",
+                    parse_count,
+                    total_parsable,
+                    parse_count as f64 / total_parsable as f64 * 100.0
+                );
             }
         }
     }
@@ -438,6 +495,7 @@ pub struct ResultMessage {
     metadata: FiestaMetadata,
     child: Option<Child>,
     time: f64,
+    size: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -473,7 +531,7 @@ pub struct ResultsWriter {
 
 impl ResultsWriter {
     pub fn convert_fields_to_header() -> String {
-        "bytecode_hash,result,time (sec),source_type\n".to_string()
+        "bytecode_hash,result,time (sec),source_type,source_size\n".to_string()
     }
 
     pub fn initiate_headers_for_results_csv(&self) {
@@ -484,12 +542,18 @@ impl ResultsWriter {
             .create(true)
             .open(&self.output_path)
             .unwrap();
-        
+
         let header_string = Self::convert_fields_to_header();
         file.write_all(header_string.as_bytes()).unwrap();
     }
 
-    pub fn append_to_results_file(&self, metadata: &FiestaMetadata, exit_type: &ExitType, time: f64) {
+    pub fn append_to_results_file(
+        &self,
+        metadata: &FiestaMetadata,
+        exit_type: &ExitType,
+        time: f64,
+        size: u64,
+    ) {
         let mut file = OpenOptions::new()
             .append(true)
             .create(true)
@@ -499,10 +563,11 @@ impl ResultsWriter {
         let bytecode_hash = metadata.bytecode_hash.clone();
         let source_type = metadata.source_type.clone().unwrap();
 
-        let result_row = ResultsRow::from(exit_type.clone(), bytecode_hash, source_type, time);
-        
+        let result_row =
+            ResultsRow::from(exit_type.clone(), bytecode_hash, source_type, time, size);
+
         let row_string = result_row.convert_to_csv_string();
-    
+
         file.write_all(row_string.as_bytes()).unwrap();
     }
 }
@@ -512,22 +577,31 @@ pub struct ResultsRow {
     pub result: ExitType,
     pub time: f64,
     pub source_type: SourceType,
+    pub size: u64,
 }
 
 impl ResultsRow {
-    
-    pub fn from(result: ExitType, bytecode_hash: String, source_type: SourceType, time: f64) -> Self {
-
+    pub fn from(
+        result: ExitType,
+        bytecode_hash: String,
+        source_type: SourceType,
+        time: f64,
+        size: u64,
+    ) -> Self {
         Self {
             bytecode_hash,
             result: result.clone(),
             time,
             source_type,
+            size,
         }
     }
 
     pub fn convert_to_csv_string(&self) -> String {
-        format!("{},{},{:.3},{}\n", self.bytecode_hash, self.result, self.time, self.source_type)
+        format!(
+            "{},{},{:.3},{},{}\n",
+            self.bytecode_hash, self.result, self.time, self.source_type, self.size
+        )
     }
 }
 
@@ -542,39 +616,47 @@ pub fn check_child_exit(child: Child) -> ExitType {
         let mut stderr_string = String::new();
         std::io::Read::read_to_string(&mut stderr, &mut stderr_string).unwrap();
 
-        
         // convert stdout into one of the ExitType variants
         convert_pyrometer_output_to_exit_type(stdout_string, stderr_string)
-
     } else {
         dbg!(&child);
         panic!("Child stdout is None")
     }
 }
 
-pub fn convert_pyrometer_output_to_exit_type(stdout_string: String, stderr_string: String) -> ExitType {
+pub fn convert_pyrometer_output_to_exit_type(
+    stdout_string: String,
+    stderr_string: String,
+) -> ExitType {
     // Check if the output is from stderr and contains the phrase "thread 'main' panicked at"
+    if let Some(debug_panic_err) = DEBUG_PANIC_REGEX.captures(&stderr_string) {
+        return ExitType::ThreadPanic(debug_panic_err[1].to_string());
+    }
+
     if let Some(captures) = PANIC_REGEX.captures(&stderr_string) {
         return ExitType::ThreadPanic(captures[1].to_string());
     }
-    
+
+    if let Some(_captures) = STACK_OVERFLOW_REGEX.captures(&stderr_string) {
+        return ExitType::ThreadPanic("Stack overflow".to_string());
+    }
+
     // Check if the output is from stdout and contains an error message
     if let Some(captures) = ERROR_REGEX.captures(&stdout_string) {
-        let error_message = format!("{}", captures[1].trim());
+        let error_message = captures[1].trim().to_string();
         return ExitType::Error(error_message);
     }
-    
+
     // Check if the output is from stdout and contains a success message
     if SUCCESS_REGEX.is_match(&stdout_string) {
         return ExitType::Success;
     }
-    
+
     // If none of the above patterns are matched, return a NonInterpreted variant.
     ExitType::NonInterpreted(stdout_string, stderr_string)
 }
 
 pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
-
     /*
     There will either be a main.sol file, several .sol files of different names, or a contracts.json file
     - first look for contracts.json
@@ -593,7 +675,7 @@ pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
             let json_string = std::fs::read_to_string(path_to_contract.clone()).unwrap();
             // println!("{:#?}", &json_string);
             let contract_metadata: SourceCodeMetadata = serde_json::from_str(&json_string).unwrap();
-            metadata.update_source_type(SourceType::EtherscanMetadata(contract_metadata));            
+            metadata.update_source_type(SourceType::EtherscanMetadata(contract_metadata));
             break;
         }
     }
@@ -611,18 +693,22 @@ pub fn collect_contract_sources(metadata: &mut FiestaMetadata) {
 
         if sol_files.len() == 1 {
             path_to_contract = sol_files[0].to_path_buf();
-            metadata.update_source_type(SourceType::SingleMain(std::fs::read_to_string(path_to_contract.clone()).unwrap()));
-        } else if sol_files.len() == 0 {
+            metadata.update_source_type(SourceType::SingleMain(
+                std::fs::read_to_string(path_to_contract.clone()).unwrap(),
+            ));
+        } else if sol_files.is_empty() {
             println!("Found no .sol files: {}. this is likely a main.vy that should be a main.sol. needs changed", &path_to_dir.display())
             // could go to path_to_contract and rename main.vy to main.sol
-        }
-        else {
+        } else {
             // if there are multiple .sol files, look for main.sol
-            let mut multiple_files = sol_files.into_iter().map(|path| {
-                let name = path.file_name().unwrap().to_str().unwrap().to_string();
-                let string = std::fs::read_to_string(path).unwrap();
-                (name, string)
-            }).collect::<Vec<(String, String)>>();
+            let mut multiple_files = sol_files
+                .into_iter()
+                .map(|path| {
+                    let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                    let string = std::fs::read_to_string(path).unwrap();
+                    (name, string)
+                })
+                .collect::<Vec<(String, String)>>();
             multiple_files.sort_by(|a, b| a.0.cmp(&b.0));
             metadata.update_source_type(SourceType::Multiple(multiple_files));
         }
