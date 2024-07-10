@@ -2,3 +2,5 @@
 .env
 /data/*
 /.vscode
+.ipyn
+/.ipynb_checkpoints
